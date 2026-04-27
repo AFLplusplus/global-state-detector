@@ -1,7 +1,7 @@
 CC := clang
 CFLAGS := -I. -g -O1
-FUZZER_CFLAGS := -fsanitize-coverage=inline-8bit-counters,pc-table
-FUZZER_LDFLAGS := -fsanitize=fuzzer
+FUZZER_CFLAGS := -fsanitize=fuzzer,address,undefined
+FUZZER_LDFLAGS := -fsanitize=fuzzer,address,undefined
 LDLIBS := -ldl
 LDFLAGS := -Wl,--export-dynamic -Wl,-z,now
 

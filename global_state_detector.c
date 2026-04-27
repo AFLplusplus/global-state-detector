@@ -49,6 +49,29 @@
 #define PROBE_MAX_REGIONS 512
 #define PROBE_MAX_REPORTS 32                              /* per check call */
 
+/* AddressSanitizer instruments globals with red zones and intercepts memcpy.
+ * Walking entire writable PT_LOAD segments unavoidably crosses those red
+ * zones, which would trip global-buffer-overflow on every iteration. The
+ * detector reads raw bytes only to hash and snapshot them, so we exempt the
+ * accessor functions and use an open-coded copy that the ASAN runtime does
+ * not intercept. */
+#if defined(__has_attribute)
+#  if __has_attribute(no_sanitize_address)
+#    define PROBE_NO_ASAN __attribute__((no_sanitize_address))
+#  endif
+#endif
+#ifndef PROBE_NO_ASAN
+#  define PROBE_NO_ASAN
+#endif
+
+static PROBE_NO_ASAN void probe_bytecopy(uint8_t *dst, const uint8_t *src,
+                                         size_t n) {
+
+  for (size_t i = 0; i < n; i++)
+    dst[i] = src[i];
+
+}
+
 typedef struct {
 
   const char *module;
@@ -125,7 +148,8 @@ static int should_skip_module(const char *name) {
 }
 
 /* FNV-1a, fast enough per page; swap for CRC32 intrinsic if you care. */
-static uint32_t hash_region_page(const region_t *r, size_t off, size_t n) {
+static PROBE_NO_ASAN uint32_t hash_region_page(const region_t *r, size_t off,
+                                               size_t n) {
 
   uint32_t h = 2166136261u;
   for (size_t i = 0; i < n; i++) {
@@ -193,14 +217,14 @@ static int phdr_cb(struct dl_phdr_info *info, size_t sz, void *data) {
 
 }
 
-static void snapshot_region(region_t *r) {
+static PROBE_NO_ASAN void snapshot_region(region_t *r) {
 
   for (size_t i = 0; i < r->npages; i++) {
 
     size_t off = i * PROBE_PAGE_SIZE;
     size_t n =
         (off + PROBE_PAGE_SIZE > r->len) ? (r->len - off) : PROBE_PAGE_SIZE;
-    memcpy(r->snapshot + off, r->start + off, n);
+    probe_bytecopy(r->snapshot + off, r->start + off, n);
     r->page_hash[i] = hash_region_page(r, off, n);
 
   }
@@ -242,7 +266,8 @@ static void resolve_sym(uintptr_t addr, const char **name, ptrdiff_t *off) {
 
 }
 
-static void report_page_diff(region_t *r, size_t page, int *reports_left) {
+static PROBE_NO_ASAN void report_page_diff(region_t *r, size_t page,
+                                           int *reports_left) {
 
   size_t off = page * PROBE_PAGE_SIZE;
   size_t n =
@@ -289,7 +314,7 @@ static void report_page_diff(region_t *r, size_t page, int *reports_left) {
 
 }
 
-int global_state_detector_check(int rebaseline) {
+PROBE_NO_ASAN int global_state_detector_check(int rebaseline) {
 
   if (!g_initialized) {
 
@@ -319,7 +344,7 @@ int global_state_detector_check(int rebaseline) {
 
       if (rebaseline) {
 
-        memcpy(r->snapshot + off, r->start + off, n);
+        probe_bytecopy(r->snapshot + off, r->start + off, n);
         r->page_hash[p] = h;
 
       }
