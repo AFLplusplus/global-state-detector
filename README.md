@@ -118,9 +118,10 @@ Example report shape:
 ## Noise And Limitations
 
 Some runtime libraries maintain writable process state. The detector skips
-common libc, dynamic-linker, pthread, libstdc++, and vDSO modules by basename
-prefix to reduce noise, but target-specific libraries may still report expected
-state.
+common libc, dynamic-linker, pthread, libstdc++, vDSO, and replacement malloc
+implementations (jemalloc, mimalloc, tcmalloc, Hoard, snmalloc, rpmalloc,
+Scudo) by basename prefix to reduce noise, but target-specific libraries may
+still report expected state.
 
 Only writable ELF segments are covered. If a target stores persistent state on
 the heap or in custom mappings, this detector will not see it without additional

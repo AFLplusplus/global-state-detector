@@ -97,6 +97,13 @@ static const char *const g_skip_prefixes[] = {
     "libstdc++.so",                              /* GNU C++ stdlib          */
     "libstdc++-",
     "linux-vdso.so",                             /* vdso                    */
+    "libjemalloc",                               /* jemalloc allocator      */
+    "libmimalloc",                               /* mimalloc allocator      */
+    "libtcmalloc",                       /* gperftools tcmalloc (+_minimal) */
+    "libhoard",                                  /* Hoard allocator         */
+    "libsnmalloc",                               /* snmalloc allocator      */
+    "librpmalloc",                               /* rpmalloc allocator      */
+    "libscudo",                                  /* Scudo hardened malloc   */
     NULL};
 
 static int should_skip_module(const char *name) {
