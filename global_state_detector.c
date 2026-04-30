@@ -10,33 +10,38 @@
  * Software Foundation, either version 3 of the License, or (at your option) any
  * later version.
  *
- * Walks all writable PT_LOAD segments of the main binary and every loaded
- * shared object via dl_iterate_phdr, snapshots them, and diffs on demand.
- * Intended to be rebaselined immediately before target execution and checked
- * immediately after it to find globals that carry state across invocations.
+ * Walks all writable PT_LOAD segments (Linux ELF, via dl_iterate_phdr) or
+ * writable LC_SEGMENT segments (macOS Mach-O, via the dyld image APIs) of
+ * the main binary and every loaded shared object, snapshots them, and
+ * diffs on demand. Intended to be rebaselined immediately before target
+ * execution and checked immediately after it to find globals that carry
+ * state across invocations.
  *
  * Build:
  *   cc -O2 -g -c global_state_detector.c
  *
- *   Link your harness with -ldl, -Wl,--export-dynamic, and -Wl,-z,now
- *   so dladdr() can resolve symbols in the main binary and lazy binding does
- *   not look like target state!
+ *   Link your harness on Linux with -ldl, -Wl,--export-dynamic, and
+ *   -Wl,-z,now so dladdr() can resolve symbols in the main binary and
+ *   lazy binding does not look like target state.
+ *   On macOS link with -Wl,-bind_at_load (the lazy-binding equivalent);
+ *   dlopen/dladdr ship in libSystem so no explicit -ldl is required.
  *
  * Caveats:
- *   - sanitizer coverage counters are ignored when their linker-provided
- *     __sancov_cntrs range is present.
- *   - libc itself has writable state (stdio buffers, errno TLS fallback,
- *     locale, malloc arenas if they live in .bss). Expect noise there.
- *   - Heap / mmap-backed state is NOT covered by this (only .data/.bss of
- *     loaded ELF objects). For that, parse /proc/self/maps additionally.
+ *   - sanitizer coverage counters are ignored when their __sancov_cntrs
+ *     range is detected (linker-provided weak symbols on Linux,
+ *     getsectiondata() on Mach-O for the main image).
+ *   - libc / libSystem itself has writable state (stdio buffers, errno TLS
+ *     fallback, locale, malloc arenas if they live in .bss). Expect noise
+ *     there; the detector skips well-known system images by path/name.
+ *   - Heap / mmap-backed state is NOT covered (only .data/.bss-equivalent
+ *     of loaded objects). For that, parse /proc/self/maps (Linux) or
+ *     vm_region_recurse (macOS) additionally.
  *   - Not thread-safe. Call from a single thread.
  */
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
-#include <elf.h>
 #include <fcntl.h>
-#include <link.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -46,12 +51,36 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#  include <elf.h>
+#  include <link.h>
+#elif defined(__APPLE__)
+#  include <mach-o/dyld.h>
+#  include <mach-o/getsect.h>
+#  include <mach-o/loader.h>
+#  include <mach/vm_prot.h>
+#else
+#  error "global-state-detector currently supports Linux and macOS only"
+#endif
+
 #include "global_state_detector.h"
 
-#if defined(__LP64__) || defined(_LP64)
-#  define PROBE_ST_TYPE(x) ELF64_ST_TYPE(x)
-#else
-#  define PROBE_ST_TYPE(x) ELF32_ST_TYPE(x)
+#if defined(__linux__)
+#  if defined(__LP64__) || defined(_LP64)
+#    define PROBE_ST_TYPE(x) ELF64_ST_TYPE(x)
+#  else
+#    define PROBE_ST_TYPE(x) ELF32_ST_TYPE(x)
+#  endif
+#elif defined(__APPLE__)
+#  if defined(__LP64__)
+typedef struct mach_header_64 macho_header_t;
+typedef struct segment_command_64 macho_segment_t;
+#    define MACHO_LC_SEGMENT LC_SEGMENT_64
+#  else
+typedef struct mach_header macho_header_t;
+typedef struct segment_command macho_segment_t;
+#    define MACHO_LC_SEGMENT LC_SEGMENT
+#  endif
 #endif
 
 #define PROBE_PAGE_SIZE 4096
@@ -92,19 +121,30 @@ typedef struct {
 
 } region_t;
 
+#if defined(__linux__)
 extern uint8_t __start___sancov_cntrs[] __attribute__((weak));
 extern uint8_t __stop___sancov_cntrs[] __attribute__((weak));
+#endif
 
 static region_t g_regions[PROBE_MAX_REGIONS];
 static size_t g_nregions = 0;
 static size_t g_nskipped = 0;
 static int g_initialized = 0;
 
-/* Static symbol table for the main binary, loaded from /proc/self/exe at
- * init() time. dladdr() only consults the dynamic symbol table, which
- * does not contain STB_LOCAL symbols even with -rdynamic. Rust binary
- * crates emit statics with internal linkage, so without this fallback
- * they resolve as "?+0x...". */
+/* SanitizerCoverage 8-bit-counter range to ignore during snapshot/diff.
+ * Populated from linker-provided weak symbols on Linux and from
+ * getsectiondata(__DATA, __sancov_cntrs) on macOS. Zero start/end means
+ * "no range known" and disables the filter. */
+static uintptr_t g_sancov_start = 0;
+static uintptr_t g_sancov_end = 0;
+
+/* Static symbol table for the main binary, loaded from the on-disk image
+ * at init() time on Linux only. Linux dladdr() consults the dynamic
+ * symtab, which omits STB_LOCAL symbols even with -rdynamic, so Rust
+ * statics and other internal-linkage globals would resolve as "?+0x..."
+ * without this fallback. macOS dladdr() already iterates the in-memory
+ * nlist table (including local symbols), so the fallback is unused
+ * there. */
 typedef struct {
 
   uintptr_t addr;
@@ -120,18 +160,15 @@ static uintptr_t g_main_base = 0;
 
 static int ignored_addr(uintptr_t addr) {
 
-  if (__start___sancov_cntrs && __stop___sancov_cntrs) {
-
-    uintptr_t start = (uintptr_t)__start___sancov_cntrs;
-    uintptr_t stop = (uintptr_t)__stop___sancov_cntrs;
-    if (addr >= start && addr < stop)
-      return 1;
-
-  }
+  if (g_sancov_end > g_sancov_start && addr >= g_sancov_start &&
+      addr < g_sancov_end)
+    return 1;
 
   return 0;
 
 }
+
+#if defined(__linux__)
 
 /* Modules whose writable state we consider uninteresting noise.
  * Matched against the basename of dlpi_name with prefix semantics.
@@ -174,6 +211,50 @@ static int should_skip_module(const char *name) {
 
 }
 
+#elif defined(__APPLE__)
+
+/* User-installed allocator dylib basenames, mirrored from the Linux skip
+ * list. The dyld shared cache (libsystem_*, libdyld, libobjc, libc++,
+ * Frameworks) is filtered separately by path prefix below. */
+static const char *const g_macos_skip_basenames[] = {
+
+    "libjemalloc",
+    "libmimalloc",
+    "libtcmalloc",
+    "libhoard",
+    "libsnmalloc",
+    "librpmalloc",
+    "libscudo",
+    NULL};
+
+static int should_skip_module(const char *path) {
+
+  if (!path)
+    return 0;
+  /* Everything in /usr/lib and /System is dyld-shared-cache / system
+   * frameworks - the macOS analogue of the libc/ld-linux noise we filter
+   * on Linux. */
+  if (strncmp(path, "/usr/lib/", 9) == 0)
+    return 1;
+  if (strncmp(path, "/System/", 8) == 0)
+    return 1;
+
+  const char *base = strrchr(path, '/');
+  base = base ? base + 1 : path;
+  for (int i = 0; g_macos_skip_basenames[i]; i++) {
+
+    size_t n = strlen(g_macos_skip_basenames[i]);
+    if (strncmp(base, g_macos_skip_basenames[i], n) == 0)
+      return 1;
+
+  }
+
+  return 0;
+
+}
+
+#endif
+
 /* FNV-1a, fast enough per page; swap for CRC32 intrinsic if you care. */
 static PROBE_NO_ASAN uint32_t hash_region_page(const region_t *r, size_t off,
                                                size_t n) {
@@ -191,6 +272,35 @@ static PROBE_NO_ASAN uint32_t hash_region_page(const region_t *r, size_t off,
   return h;
 
 }
+
+static int add_region(const char *module, uint8_t *start, size_t len) {
+
+  if (g_nregions >= PROBE_MAX_REGIONS) {
+
+    fprintf(stderr, "[global-state-detector] PROBE_MAX_REGIONS exceeded\n");
+    return -1;
+
+  }
+
+  region_t *r = &g_regions[g_nregions++];
+  r->module = module;
+  r->start = start;
+  r->len = len;
+  r->npages = (r->len + PROBE_PAGE_SIZE - 1) / PROBE_PAGE_SIZE;
+  r->page_hash = (uint32_t *)calloc(r->npages, sizeof(uint32_t));
+  r->snapshot = (uint8_t *)malloc(r->npages * PROBE_PAGE_SIZE);
+  if (!r->page_hash || !r->snapshot) {
+
+    fprintf(stderr, "[global-state-detector] allocation failed\n");
+    abort();
+
+  }
+
+  return 0;
+
+}
+
+#if defined(__linux__)
 
 static int phdr_cb(struct dl_phdr_info *info, size_t sz, void *data) {
 
@@ -222,33 +332,115 @@ static int phdr_cb(struct dl_phdr_info *info, size_t sz, void *data) {
     if (p->p_memsz == 0)
       continue;
 
-    if (g_nregions >= PROBE_MAX_REGIONS) {
-
-      fprintf(stderr, "[global-state-detector] PROBE_MAX_REGIONS exceeded\n");
-      return 1;
-
-    }
-
-    region_t *r = &g_regions[g_nregions++];
-    r->module =
+    const char *module =
         (info->dlpi_name && info->dlpi_name[0]) ? info->dlpi_name : "[main]";
-    r->start = (uint8_t *)(info->dlpi_addr + p->p_vaddr);
-    r->len = p->p_memsz;
-    r->npages = (r->len + PROBE_PAGE_SIZE - 1) / PROBE_PAGE_SIZE;
-    r->page_hash = (uint32_t *)calloc(r->npages, sizeof(uint32_t));
-    r->snapshot = (uint8_t *)malloc(r->npages * PROBE_PAGE_SIZE);
-    if (!r->page_hash || !r->snapshot) {
-
-      fprintf(stderr, "[global-state-detector] allocation failed\n");
-      abort();
-
-    }
+    if (add_region(module, (uint8_t *)(info->dlpi_addr + p->p_vaddr),
+                   (size_t)p->p_memsz) != 0)
+      return 1;
 
   }
 
   return 0;
 
 }
+
+static void discover_regions(void) {
+
+  dl_iterate_phdr(phdr_cb, NULL);
+
+}
+
+static void resolve_sancov_range(void) {
+
+  if (__start___sancov_cntrs && __stop___sancov_cntrs) {
+
+    g_sancov_start = (uintptr_t)__start___sancov_cntrs;
+    g_sancov_end = (uintptr_t)__stop___sancov_cntrs;
+
+  }
+
+}
+
+#elif defined(__APPLE__)
+
+static void discover_regions(void) {
+
+  uint32_t n = _dyld_image_count();
+  for (uint32_t i = 0; i < n; i++) {
+
+    const char *path = _dyld_get_image_name(i);
+    const macho_header_t *mh =
+        (const macho_header_t *)_dyld_get_image_header(i);
+    if (!mh)
+      continue;
+    intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+    int is_main = (i == 0);
+
+    if (is_main) {
+
+      g_main_base = (uintptr_t)slide;
+
+    } else if (should_skip_module(path)) {
+
+      g_nskipped++;
+      continue;
+
+    }
+
+    const struct load_command *lc = (const struct load_command *)(mh + 1);
+    for (uint32_t j = 0; j < mh->ncmds; j++) {
+
+      if (lc->cmd == MACHO_LC_SEGMENT) {
+
+        const macho_segment_t *seg = (const macho_segment_t *)lc;
+        /* Match the Linux PT_LOAD filter: writable, non-executable,
+         * non-empty. __PAGEZERO has initprot=0 so it is filtered here;
+         * __LINKEDIT is read-only so it is too; __TEXT is executable.
+         * That leaves __DATA (the .data/.bss-equivalent we want) and
+         * any other writable user segments. */
+        if ((seg->initprot & VM_PROT_WRITE) &&
+            !(seg->initprot & VM_PROT_EXECUTE) && seg->vmsize > 0) {
+
+          uint8_t *start =
+              (uint8_t *)((uintptr_t)seg->vmaddr + (uintptr_t)slide);
+          const char *module = is_main ? "[main]" : (path ? path : "[?]");
+          if (add_region(module, start, (size_t)seg->vmsize) != 0)
+            return;
+
+        }
+
+      }
+
+      lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
+
+    }
+
+  }
+
+}
+
+static void resolve_sancov_range(void) {
+
+  /* SanitizerCoverage emits inline-8bit-counters into __DATA,__sancov_cntrs
+   * on Mach-O. getsectiondata() returns a runtime-relocated pointer with
+   * slide already applied. Only the main image is consulted, mirroring
+   * the linker-provided weak-symbol scope on Linux. */
+  const macho_header_t *mh = (const macho_header_t *)_dyld_get_image_header(0);
+  if (!mh)
+    return;
+  unsigned long sz = 0;
+  uint8_t *p =
+      getsectiondata((macho_header_t *)mh, "__DATA", "__sancov_cntrs", &sz);
+  if (p && sz) {
+
+    g_sancov_start = (uintptr_t)p;
+    g_sancov_end = (uintptr_t)p + sz;
+
+  }
+
+}
+
+#endif
 
 static PROBE_NO_ASAN void snapshot_region(region_t *r) {
 
@@ -263,6 +455,8 @@ static PROBE_NO_ASAN void snapshot_region(region_t *r) {
   }
 
 }
+
+#if defined(__linux__)
 
 static int sym_cmp(const void *a, const void *b) {
 
@@ -421,12 +615,17 @@ static int lookup_main_symbol(uintptr_t addr, const char **name,
 
 }
 
+#endif  /* __linux__ */
+
 void global_state_detector_init(void) {
 
   if (g_initialized)
     return;
-  dl_iterate_phdr(phdr_cb, NULL);
+  resolve_sancov_range();
+  discover_regions();
+#if defined(__linux__)
   load_main_symtab();
+#endif
   g_initialized = 1;
   for (size_t i = 0; i < g_nregions; i++)
     snapshot_region(&g_regions[i]);
@@ -442,11 +641,14 @@ void global_state_detector_init(void) {
 
 static void resolve_sym(uintptr_t addr, const char **name, ptrdiff_t *off) {
 
+#if defined(__linux__)
   /* Prefer the static symtab for the main binary - it includes STB_LOCAL
-   * symbols (Rust statics, internal C/C++ globals) that dladdr cannot
-   * see. Fall through to dladdr for shared libraries. */
+   * symbols (Rust statics, internal C/C++ globals) that Linux dladdr
+   * cannot see. Fall through to dladdr for shared libraries. macOS
+   * dladdr already covers locals so this fallback is Linux-only. */
   if (lookup_main_symbol(addr, name, off))
     return;
+#endif
 
   Dl_info di;
   if (dladdr((void *)addr, &di) && di.dli_sname) {

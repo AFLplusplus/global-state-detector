@@ -28,17 +28,50 @@ thread-local storage, files, sockets, or other external process state.
 
 ## Platform Assumptions
 
-The implementation targets Linux ELF processes and uses:
+Linux (ELF) and macOS (Mach-O) are supported. The two paths are selected at
+compile time and share all of the snapshot/diff/reporting logic.
 
-- `dl_iterate_phdr`
-- `dladdr`
-- ELF program headers from `<elf.h>` and `<link.h>`
+Linux:
 
-Builds should use a clang based fuzzer compiler (e.g. `afl-clang-fast` for
-AFL++, `clang` for libfuzzer, etc.).
-Link with `-ldl -Wl,--export-dynamic -Wl,-z,now` for best results so symbol
-names in the main executable can be resolved in reports and lazy PLT/GOT binding
-does not show up as first-iteration writable state.
+- `dl_iterate_phdr` to walk loaded objects
+- `dladdr` and a fallback `/proc/self/exe` `SHT_SYMTAB` parser for symbol
+  resolution (the parser also picks up `STB_LOCAL` symbols that `dladdr`
+  cannot see, e.g. Rust binary-crate statics)
+- ELF program headers from `<elf.h>` / `<link.h>`
+- Link the harness with `-ldl -Wl,--export-dynamic -Wl,-z,now` so symbol
+  names in the main executable can be resolved and lazy PLT/GOT binding
+  does not show up as first-iteration writable state.
+
+macOS:
+
+- `_dyld_image_count` / `_dyld_get_image_header` / `_dyld_get_image_name`
+  to walk loaded Mach-O images
+- `dladdr` for symbol resolution (already iterates the in-memory `nlist`
+  table, including locals — no separate fallback needed)
+- Mach-O headers from `<mach-o/dyld.h>` / `<mach-o/loader.h>` /
+  `<mach-o/getsect.h>`
+- No extra link flags required. `dlopen`/`dladdr` ship in `libSystem`, and
+  modern Mach-O linkers bind eagerly by default (chained fixups), so the
+  Linux `-z,now` / `--export-dynamic` equivalents are unnecessary.
+
+Builds should use a clang-based fuzzer compiler (e.g. `afl-clang-fast` for
+AFL++, `clang` for libFuzzer).
+
+### AddressSanitizer Is Broken On Recent macOS
+
+On recent Darwin, `-fsanitize=address` does not work: any harness — even
+hello-world — wedges at process init and spins at 100% CPU before `main`
+runs. This has been observed with both Apple Silicon Apple Clang
+(clang-2100.x) and Homebrew LLVM 21 on macOS 15+. The issue is in the
+ASan runtime / loader interaction, not in this detector; the detector
+itself works fine on macOS without ASan.
+
+The provided Makefile therefore drops `address` from the example's
+sanitizer set on Darwin, building with `-fsanitize=fuzzer,undefined`
+instead of the full Linux `-fsanitize=fuzzer,address,undefined`. To
+exercise ASan integration on macOS you'll need to find a working
+clang/runtime combination and override `FUZZER_CFLAGS` /
+`FUZZER_LDFLAGS` by hand.
 
 ## Build
 
@@ -121,7 +154,9 @@ Some runtime libraries maintain writable process state. The detector skips
 common libc, dynamic-linker, pthread, libstdc++, vDSO, and replacement malloc
 implementations (jemalloc, mimalloc, tcmalloc, Hoard, snmalloc, rpmalloc,
 Scudo) by basename prefix to reduce noise, but target-specific libraries may
-still report expected state.
+still report expected state. On macOS the entire dyld shared cache and
+`/System` frameworks tree are skipped by path prefix in addition to the
+allocator basenames.
 
 Only writable ELF segments are covered. If a target stores persistent state on
 the heap or in custom mappings, this detector will not see it without additional
